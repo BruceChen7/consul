@@ -1,10 +1,26 @@
 package subscribe
 
-/* TODO
-func TestStreaming_Subscribe(t *testing.T) {
-	t.Parallel()
+import (
+	"context"
+	"errors"
+	"io"
+	"os"
+	"testing"
+	"time"
 
-	require := require.New(t)
+	"github.com/google/go-cmp/cmp"
+	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/proto/pbcommon"
+	"github.com/hashicorp/consul/proto/pbservice"
+	"github.com/hashicorp/consul/proto/pbsubscribe"
+	"github.com/hashicorp/consul/testrpc"
+	"github.com/hashicorp/consul/types"
+	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc"
+	"github.com/stretchr/testify/require"
+)
+
+func TestStreaming_Subscribe(t *testing.T) {
+	require := require.New(t) // TODO: remove
 	dir1, server := testServerWithConfig(t, func(c *Config) {
 		c.Datacenter = "dc1"
 		c.Bootstrap = true
@@ -82,7 +98,7 @@ func TestStreaming_Subscribe(t *testing.T) {
 	conn, err := client.GRPCConn()
 	require.NoError(err)
 
-	streamClient := pbsubscribe.NewConsulClient(conn)
+	streamClient := pbsubscribe.NewStateChangeSubscriptionClient(conn)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
@@ -92,15 +108,15 @@ func TestStreaming_Subscribe(t *testing.T) {
 	})
 	require.NoError(err)
 
-	// Start a goroutine to read updates off the pbsubscribe.
-	eventCh := make(chan *pbsubscribe.Event, 0)
-	go testSendEvents(t, eventCh, streamHandle)
+	eventCh := make(chan eventOrError, 0)
+	go recvEvents(eventCh, streamHandle)
 
 	var snapshotEvents []*pbsubscribe.Event
 	for i := 0; i < 3; i++ {
 		select {
-		case event := <-eventCh:
-			snapshotEvents = append(snapshotEvents, event)
+		case item := <-eventCh:
+			require.NoError(err)
+			snapshotEvents = append(snapshotEvents, item.event)
 		case <-time.After(3 * time.Second):
 			t.Fatalf("did not receive events past %d", len(snapshotEvents))
 		}
@@ -113,24 +129,24 @@ func TestStreaming_Subscribe(t *testing.T) {
 			Payload: &pbsubscribe.Event_ServiceHealth{
 				ServiceHealth: &pbsubscribe.ServiceHealthUpdate{
 					Op: pbsubscribe.CatalogOp_Register,
-					CheckServiceNode: &pbsubscribe.CheckServiceNode{
-						Node: &pbsubscribe.Node{
+					CheckServiceNode: &pbservice.CheckServiceNode{
+						Node: &pbservice.Node{
 							Node:       "node1",
 							Datacenter: "dc1",
 							Address:    "3.4.5.6",
 						},
-						Service: &pbsubscribe.NodeService{
+						Service: &pbservice.NodeService{
 							ID:      "redis1",
 							Service: "redis",
 							Address: "3.4.5.6",
 							Port:    8080,
-							Weights: &pbsubscribe.Weights{Passing: 1, Warning: 1},
+							Weights: &pbservice.Weights{Passing: 1, Warning: 1},
 							// Sad empty state
-							Proxy: pbsubscribe.ConnectProxyConfig{
-								MeshGateway: &pbsubscribe.MeshGatewayConfig{},
-								Expose:      &pbsubscribe.ExposeConfig{},
+							Proxy: pbservice.ConnectProxyConfig{
+								MeshGateway: pbservice.MeshGatewayConfig{},
+								Expose:      pbservice.ExposeConfig{},
 							},
-							EnterpriseMeta: &pbsubscribe.EnterpriseMeta{},
+							EnterpriseMeta: pbcommon.EnterpriseMeta{},
 						},
 					},
 				},
@@ -142,24 +158,24 @@ func TestStreaming_Subscribe(t *testing.T) {
 			Payload: &pbsubscribe.Event_ServiceHealth{
 				ServiceHealth: &pbsubscribe.ServiceHealthUpdate{
 					Op: pbsubscribe.CatalogOp_Register,
-					CheckServiceNode: &pbsubscribe.CheckServiceNode{
-						Node: &pbsubscribe.Node{
+					CheckServiceNode: &pbservice.CheckServiceNode{
+						Node: &pbservice.Node{
 							Node:       "node2",
 							Datacenter: "dc1",
 							Address:    "1.2.3.4",
 						},
-						Service: &pbsubscribe.NodeService{
+						Service: &pbservice.NodeService{
 							ID:      "redis1",
 							Service: "redis",
 							Address: "1.1.1.1",
 							Port:    8080,
-							Weights: &pbsubscribe.Weights{Passing: 1, Warning: 1},
+							Weights: &pbservice.Weights{Passing: 1, Warning: 1},
 							// Sad empty state
-							Proxy: pbsubscribe.ConnectProxyConfig{
-								MeshGateway: &pbsubscribe.MeshGatewayConfig{},
-								Expose:      &pbsubscribe.ExposeConfig{},
+							Proxy: pbservice.ConnectProxyConfig{
+								MeshGateway: pbservice.MeshGatewayConfig{},
+								Expose:      pbservice.ExposeConfig{},
 							},
-							EnterpriseMeta: &pbsubscribe.EnterpriseMeta{},
+							EnterpriseMeta: pbcommon.EnterpriseMeta{},
 						},
 					},
 				},
@@ -183,7 +199,7 @@ func TestStreaming_Subscribe(t *testing.T) {
 	// Fix index on snapshot event
 	expected[2].Index = snapshotEvents[2].Index
 
-	requireEqualProtos(t, expected, snapshotEvents)
+	assertDeepEqual(t, expected, snapshotEvents)
 
 	// Update the registration by adding a check.
 	req.Check = &structs.HealthCheck{
@@ -195,62 +211,69 @@ func TestStreaming_Subscribe(t *testing.T) {
 	}
 	require.NoError(msgpackrpc.CallWithCodec(codec, "Catalog.Register", &req, &out))
 
-	// Make sure we get the event for the diff.
+	var event *pbsubscribe.Event
 	select {
-	case event := <-eventCh:
-		expected := &pbsubscribe.Event{
-			Topic: pbsubscribe.Topic_ServiceHealth,
-			Key:   "redis",
-			Payload: &pbsubscribe.Event_ServiceHealth{
-				ServiceHealth: &pbsubscribe.ServiceHealthUpdate{
-					Op: pbsubscribe.CatalogOp_Register,
-					CheckServiceNode: &pbsubscribe.CheckServiceNode{
-						Node: &pbsubscribe.Node{
-							Node:       "node2",
-							Datacenter: "dc1",
-							Address:    "1.2.3.4",
-							RaftIndex:  pbsubscribe.RaftIndex{CreateIndex: 13, ModifyIndex: 13},
+	case item := <-eventCh:
+		require.NoError(item.err)
+		event = item.event
+	case <-time.After(3 * time.Second):
+		t.Fatal("never got event")
+	}
+
+	expectedEvent := &pbsubscribe.Event{
+		Topic: pbsubscribe.Topic_ServiceHealth,
+		Key:   "redis",
+		Payload: &pbsubscribe.Event_ServiceHealth{
+			ServiceHealth: &pbsubscribe.ServiceHealthUpdate{
+				Op: pbsubscribe.CatalogOp_Register,
+				CheckServiceNode: &pbservice.CheckServiceNode{
+					Node: &pbservice.Node{
+						Node:       "node2",
+						Datacenter: "dc1",
+						Address:    "1.2.3.4",
+						RaftIndex:  pbcommon.RaftIndex{CreateIndex: 13, ModifyIndex: 13},
+					},
+					Service: &pbservice.NodeService{
+						ID:        "redis1",
+						Service:   "redis",
+						Address:   "1.1.1.1",
+						Port:      8080,
+						RaftIndex: pbcommon.RaftIndex{CreateIndex: 13, ModifyIndex: 13},
+						Weights:   &pbservice.Weights{Passing: 1, Warning: 1},
+						// Sad empty state
+						Proxy: pbservice.ConnectProxyConfig{
+							MeshGateway: pbservice.MeshGatewayConfig{},
+							Expose:      pbservice.ExposeConfig{},
 						},
-						Service: &pbsubscribe.NodeService{
-							ID:        "redis1",
-							Service:   "redis",
-							Address:   "1.1.1.1",
-							Port:      8080,
-							RaftIndex: pbsubscribe.RaftIndex{CreateIndex: 13, ModifyIndex: 13},
-							Weights:   &pbsubscribe.Weights{Passing: 1, Warning: 1},
-							// Sad empty state
-							Proxy: pbsubscribe.ConnectProxyConfig{
-								MeshGateway: &pbsubscribe.MeshGatewayConfig{},
-								Expose:      &pbsubscribe.ExposeConfig{},
-							},
-							EnterpriseMeta: &pbsubscribe.EnterpriseMeta{},
-						},
-						Checks: []*pbsubscribe.HealthCheck{
-							{
-								CheckID:        "check1",
-								Name:           "check 1",
-								Node:           "node2",
-								Status:         "critical",
-								ServiceID:      "redis1",
-								ServiceName:    "redis",
-								RaftIndex:      pbsubscribe.RaftIndex{CreateIndex: 14, ModifyIndex: 14},
-								EnterpriseMeta: &pbsubscribe.EnterpriseMeta{},
-							},
+						EnterpriseMeta: pbcommon.EnterpriseMeta{},
+					},
+					Checks: []*pbservice.HealthCheck{
+						{
+							CheckID:        "check1",
+							Name:           "check 1",
+							Node:           "node2",
+							Status:         "critical",
+							ServiceID:      "redis1",
+							ServiceName:    "redis",
+							RaftIndex:      pbcommon.RaftIndex{CreateIndex: 14, ModifyIndex: 14},
+							EnterpriseMeta: pbcommon.EnterpriseMeta{},
 						},
 					},
 				},
 			},
-		}
-		// Fix up the index
-		expected.Index = event.Index
-		node := expected.GetServiceHealth().CheckServiceNode
-		node.Node.RaftIndex = event.GetServiceHealth().CheckServiceNode.Node.RaftIndex
-		node.Service.RaftIndex = event.GetServiceHealth().CheckServiceNode.Service.RaftIndex
-		node.Checks[0].RaftIndex = event.GetServiceHealth().CheckServiceNode.Checks[0].RaftIndex
-		requireEqualProtos(t, expected, event)
-	case <-time.After(3 * time.Second):
-		t.Fatal("never got event")
+		},
 	}
+
+	// TODO: use a cmp.Option if we need to.
+	//expectedEvent.Index = event.Index
+	//node := expected.GetServiceHealth().CheckServiceNode
+	//node.Node.RaftIndex = event.GetServiceHealth().CheckServiceNode.Node.RaftIndex
+	//node.Service.RaftIndex = event.GetServiceHealth().CheckServiceNode.Service.RaftIndex
+	//node.Checks[0].RaftIndex = event.GetServiceHealth().CheckServiceNode.Checks[0].RaftIndex
+	assertDeepEqual(t, expectedEvent, event)
+
+	// TODO: close the server so that we only need to wait on it to close and we can use
+	// a longer timeout.
 
 	// Wait and make sure there aren't any more events coming.
 	select {
@@ -260,6 +283,38 @@ func TestStreaming_Subscribe(t *testing.T) {
 	}
 }
 
+type eventOrError struct {
+	event *pbsubscribe.Event
+	err   error
+}
+
+// recvEvents from handle and sends them to the provided channel.
+func recvEvents(ch chan eventOrError, handle pbsubscribe.StateChangeSubscription_SubscribeClient) {
+	for {
+		event, err := handle.Recv()
+		switch {
+		case errors.Is(err, io.EOF):
+			return
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			return
+		case err != nil:
+			ch <- eventOrError{err: err}
+			close(ch)
+			return
+		default:
+			ch <- eventOrError{event: event}
+		}
+	}
+}
+
+func assertDeepEqual(t *testing.T, x, y interface{}) {
+	t.Helper()
+	if diff := cmp.Diff(x, y); diff != "" {
+		t.Fatalf("assertion failed: values are not equal\n--- expected\n+++ actual\n%v", diff)
+	}
+}
+
+/* TODO
 func TestStreaming_Subscribe_MultiDC(t *testing.T) {
 	t.Parallel()
 
@@ -365,7 +420,7 @@ func TestStreaming_Subscribe_MultiDC(t *testing.T) {
 
 	// Start a goroutine to read updates off the pbsubscribe.
 	eventCh := make(chan *pbsubscribe.Event, 0)
-	go testSendEvents(t, eventCh, streamHandle)
+	go recvEvents(t, eventCh, streamHandle)
 
 	var snapshotEvents []*pbsubscribe.Event
 	for i := 0; i < 3; i++ {
@@ -452,7 +507,7 @@ func TestStreaming_Subscribe_MultiDC(t *testing.T) {
 		node.Service.RaftIndex = snapshotEvents[i].GetServiceHealth().CheckServiceNode.Service.RaftIndex
 	}
 	expected[2].Index = snapshotEvents[2].Index
-	requireEqualProtos(t, expected, snapshotEvents)
+	assertDeepEqual(t, expected, snapshotEvents)
 
 	// Update the registration by adding a check.
 	req.Check = &structs.HealthCheck{
@@ -516,7 +571,7 @@ func TestStreaming_Subscribe_MultiDC(t *testing.T) {
 		node.Node.RaftIndex = event.GetServiceHealth().CheckServiceNode.Node.RaftIndex
 		node.Service.RaftIndex = event.GetServiceHealth().CheckServiceNode.Service.RaftIndex
 		node.Checks[0].RaftIndex = event.GetServiceHealth().CheckServiceNode.Checks[0].RaftIndex
-		requireEqualProtos(t, expected, event)
+		assertDeepEqual(t, expected, event)
 	case <-time.After(3 * time.Second):
 		t.Fatal("never got event")
 	}
@@ -588,7 +643,7 @@ func TestStreaming_Subscribe_SkipSnapshot(t *testing.T) {
 
 		// Start a goroutine to read updates off the pbsubscribe.
 		eventCh := make(chan *pbsubscribe.Event, 0)
-		go testSendEvents(t, eventCh, streamHandle)
+		go recvEvents(t, eventCh, streamHandle)
 
 		var snapshotEvents []*pbsubscribe.Event
 		for i := 0; i < 2; i++ {
@@ -617,7 +672,7 @@ func TestStreaming_Subscribe_SkipSnapshot(t *testing.T) {
 
 		// Start a goroutine to read updates off the pbsubscribe.
 		eventCh := make(chan *pbsubscribe.Event, 0)
-		go testSendEvents(t, eventCh, streamHandle)
+		go recvEvents(t, eventCh, streamHandle)
 
 		// We should get no snapshot and the first event should be "resume stream"
 		select {
@@ -737,7 +792,7 @@ func TestStreaming_Subscribe_FilterACL(t *testing.T) {
 
 		// Start a goroutine to read updates off the pbsubscribe.
 		eventCh := make(chan *pbsubscribe.Event, 0)
-		go testSendEvents(t, eventCh, streamHandle)
+		go recvEvents(t, eventCh, streamHandle)
 
 		// Read events off the pbsubscribe. We should not see any events for the filtered node.
 		var snapshotEvents []*pbsubscribe.Event
@@ -823,7 +878,7 @@ func TestStreaming_Subscribe_FilterACL(t *testing.T) {
 
 		// Start a goroutine to read updates off the pbsubscribe.
 		eventCh := make(chan *pbsubscribe.Event, 0)
-		go testSendEvents(t, eventCh, streamHandle)
+		go recvEvents(t, eventCh, streamHandle)
 
 		select {
 		case event := <-eventCh:
@@ -939,7 +994,7 @@ func TestStreaming_Subscribe_ACLUpdate(t *testing.T) {
 
 		// Start a goroutine to read updates off the pbsubscribe.
 		eventCh := make(chan *pbsubscribe.Event, 0)
-		go testSendEvents(t, eventCh, streamHandle)
+		go recvEvents(t, eventCh, streamHandle)
 
 		// Read events off the pbsubscribe.
 		var snapshotEvents []*pbsubscribe.Event
@@ -995,25 +1050,6 @@ func TestStreaming_Subscribe_ACLUpdate(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatalf("did not receive reload event")
 		}
-	}
-}
-
-// testSendEvents receives pbsubscribe.Events from a given handle and sends them to the provided
-// channel. This is meant to be run in a separate goroutine from the main test.
-func testSendEvents(t *testing.T, ch chan *pbsubscribe.Event, handle pbsubscribe.StateChangeSubscription_SubscribeClient) {
-	for {
-		event, err := handle.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			if strings.Contains(err.Error(), "context deadline exceeded") ||
-				strings.Contains(err.Error(), "context canceled") {
-				break
-			}
-			t.Log(err)
-		}
-		ch <- event
 	}
 }
 
@@ -1079,7 +1115,7 @@ func TestStreaming_TLSEnabled(t *testing.T) {
 
 		// Start a goroutine to read updates off the pbsubscribe.
 		eventCh := make(chan *pbsubscribe.Event, 0)
-		go testSendEvents(t, eventCh, streamHandle)
+		go recvEvents(t, eventCh, streamHandle)
 
 		var snapshotEvents []*pbsubscribe.Event
 		for i := 0; i < 2; i++ {
@@ -1110,7 +1146,7 @@ func TestStreaming_TLSEnabled(t *testing.T) {
 
 		// Start a goroutine to read updates off the pbsubscribe.
 		eventCh := make(chan *pbsubscribe.Event, 0)
-		go testSendEvents(t, eventCh, streamHandle)
+		go recvEvents(t, eventCh, streamHandle)
 
 		var snapshotEvents []*pbsubscribe.Event
 		for i := 0; i < 2; i++ {
@@ -1417,18 +1453,5 @@ func svcOrErr(event *pbsubscribe.Event) (*pbservice.NodeService, error) {
 		return nil, fmt.Errorf("nil service: %#v", event)
 	}
 	return csn.Service, nil
-}
-
-// requireEqualProtos is a helper that runs arrays or structures containing
-// proto buf messages through JSON encoding before comparing/diffing them. This
-// is necessary because require.Equal doesn't compare them equal and generates
-// really unhelpful output in this case for some reason.
-func requireEqualProtos(t *testing.T, want, got interface{}) {
-	t.Helper()
-	gotJSON, err := json.Marshal(got)
-	require.NoError(t, err)
-	expectJSON, err := json.Marshal(want)
-	require.NoError(t, err)
-	require.JSONEq(t, string(expectJSON), string(gotJSON))
 }
 */
